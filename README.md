@@ -1,1 +1,1 @@
-# RI-project
+# Computer Networks project
