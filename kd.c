@@ -1,4 +1,8 @@
-#include "common.c"
+#include "client_side/communication_utilities/soc_client_utils.c"
+#include "client_side/headers/header_order.h"
+#include "client_side/headers/header_kitchen.h"
+#include "client_side/order_shared_utils.c"
+#include "server_side/order_shared_utils.c"
 
 void print_cmd()
 {
@@ -10,7 +14,7 @@ void print_cmd()
     return;
 }
 
-void rcv_ord_pnd(int soc)
+void receive_open_orders(int soc)
 {
     int ret, i, pnd;
     uint32_t conv;
@@ -35,9 +39,8 @@ void rcv_ord_pnd(int soc)
     return;
 }
 
-void show_acp(char *buf, struct order *ord)
+void show_accepted_order(char *buf, struct Order *ord)
 {
-    int ok = 0;
     FILE *f = fopen("accepted.txt", "r");
     if (!f)
     {
@@ -46,6 +49,8 @@ void show_acp(char *buf, struct order *ord)
         return;
     }
 
+    bool check = false;
+
     memset(buf, 0, MAX_SIZE);
 
     rewind(f);
@@ -53,18 +58,18 @@ void show_acp(char *buf, struct order *ord)
     {
         if (fscanf(f, " %[^\n] ", buf))
         {
-            if (sscanf(buf, "ID:%*3c com%*d T%*d STATUS = %c\n", &ord->sts))
+            if (sscanf(buf, "ID:%*3c com%*d T%*d STATUS = %d\n", &ord->status))
             {
-                if (ord->sts == '1')
+                if (ord->status == 1)
                 {
                     strcpy(&buf[16], "");
-                    ok = 1;
+                    check = true;
                 }
                 else
-                    ok = 0;
+                    check = false;
             }
 
-            if (ok == 1)
+            if (check == true)
             {
                 printf("%s\n", buf);
                 fflush(stdout);
@@ -75,7 +80,7 @@ void show_acp(char *buf, struct order *ord)
     return;
 }
 
-void save_kd_acp(char *buf)
+void store_accepted_order(char *buf)
 {
     char ord[MAX_SIZE];
     memset(ord, 0, MAX_SIZE);
@@ -86,94 +91,62 @@ void save_kd_acp(char *buf)
         perror("Impossibile creare il file accepted.txt");
         exit(1);
     }
+
     sscanf(buf, " %[^\n] ", ord);
-    fprintf(f, "%s STATUS = 1\n", ord);
+    fprintf(f, "%s STATUS = %d\n", ord, 1);
     fprintf(f, "%s", &buf[16]);
     fclose(f);
     return;
 }
 
-void set_ready(char *n_file, struct order *ord)
+/*
+    Controlla che la porta associata dall'utente al momento
+    della chiamata al programma sia effettivamente corretta
+*/
+bool check_port_kitchen(int port)
 {
-    fpos_t pos;
-    struct order ord_found;
-    FILE *f = fopen(n_file, "r+");
-    if (!f)
-    {
-        printf("Errore nell'apertura del file\n");
-        fflush(stdout);
-        return;
-    }
+    if (port == KTC_1_PORT || port == KTC_2_PORT)
+        return true;
 
-    memset(&ord_found, 0, sizeof(struct order));
-    pos.__pos = 0;
-
-    rewind(f);
-    while (!feof(f))
-    {
-        if (fscanf(f, "ID:%d com%d T%d STATUS = %*c\n", &ord_found.id_ord, &ord_found.n_ord, &ord_found.id_tb) == 3)
-        {
-            if (ord_found.id_tb == ord->id_tb && ord_found.n_ord == ord->n_ord)
-            {
-                fgetpos(f, &pos);
-                ord->id_ord = ord_found.id_ord;
-                ord->sts = '2';
-                pos.__pos -= 2;
-                fsetpos(f, &pos);
-                fputc(ord->sts, f);
-                break;
-            }
-        }
-        else
-            fscanf(f, " %*[^\n] ");
-    }
-    fclose(f);
-
-    if (!ord->id_ord)
-    {
-        printf("Impossibile aggiornare la comanda\n");
-        fflush(stdout);
-    }
-    return;
+    return false;
 }
 
 int main(int argc, char *argv[])
 {
-    int i;
     struct sockaddr_in server_address, my_address;
-    struct select_elem kd;
-    struct order ord;
-    uint32_t conv;
-    int ret, choice;
-    char buf[MAX_SIZE];
+    struct Order ord;
+    int ret, command, i, port;
 
-    memset(&kd, 0, sizeof(struct select_elem));
+    char buf[MAX_SIZE];
+    struct Socket_stream_IO kd;
+
+    uint32_t conv;
+
+    memset(&kd, 0, sizeof(struct Socket_stream_IO));
 
     if (argc == 2)
     {
         port = atoi(argv[1]);
-        if (!check_port(port, 2))
-            ;
+        if (!check_port_kitchen(port))
         {
             perror("Porta errata\n");
             exit(1);
         }
     }
 
-    kd.soc = create_sc_client(&server_address, &my_address, 6001);
-    init_pre_select(&kd);
+    kd.soc = create_soc_client(&server_address, &my_address, 6001);
+    init_stream_IO(&kd);
     print_cmd();
 
     // invio segnale per ricevere gli ordini pendenti
-    choice = -1;
-    conv = htonl(choice);
+    conv = htonl(START_KC_DEVICE);
     ret = send(kd.soc, (void *)&conv, sizeof(uint32_t), 0);
     if (ret < 0)
     {
         printf("Errore nell'invio del segnale per la ricezione degli ordini pendenti\n");
         exit(1);
     }
-    rcv_ord_pnd(kd.soc);
+    receive_open_orders(kd.soc);
 
     for (;;)
     {
@@ -189,8 +162,9 @@ int main(int argc, char *argv[])
         for (i = 0; i <= kd.max_fd; i++)
         {
             memset(buf, 0, MAX_SIZE);
-            memset(&ord, 0, sizeof(struct order));
-            choice = 0;
+            memset(&ord, 0, sizeof(struct Order));
+
+            command = 0;
 
             if (FD_ISSET(i, &kd.read_fds))
             {
@@ -203,28 +177,29 @@ int main(int argc, char *argv[])
                         exit(1);
                     }
 
-                    choice = ntohl(conv);
-                    if (choice == -2)
+                    command = ntohl(conv);
+                    if (command == CLOSE_KD_SOCKET_CMD || command == STOP_SERVER_CMD)
                     {
                         printf("Chiusura del dispositivo in corso...\n");
                         fflush(stdout);
                         remove("accepted.txt");
                         close(kd.soc);
+
                         FD_ZERO(&kd.master);
                         FD_ZERO(&kd.read_fds);
                         return 0;
                     }
-                    else if (choice == -1)
+                    else if (command == SEND_OPEN_ORDERS_CMD)
                     {
-                        rcv_ord_pnd(kd.soc);
+                        receive_open_orders(kd.soc);
                     }
-                    else if (choice == 1)
+                    else if (command == UPDATE_STATUS_ORD_1)
                     {
                         ret = 0;
-                        rcv_file(kd.soc, buf, &ret);
+                        receive_file(kd.soc, buf, &ret);
                         printf("%s\n", buf);
                         fflush(stdout);
-                        save_kd_acp(buf);
+                        store_accepted_order(buf);
                     }
                 }
                 else if (i == STDIN_FILENO)
@@ -233,8 +208,8 @@ int main(int argc, char *argv[])
                     {
                         if (!strcmp(buf, "take\n"))
                         {
-                            choice = 1;
-                            conv = htonl(choice);
+                            command = TAKE_CMD;
+                            conv = htonl(command);
                             ret = send(kd.soc, (void *)&conv, sizeof(uint32_t), 0);
                             if (ret < 0)
                             {
@@ -244,27 +219,26 @@ int main(int argc, char *argv[])
                         }
                         else if (!strcmp(buf, "show\n"))
                         {
-                            show_acp(buf, &ord);
+                            show_accepted_order(buf, &ord);
                         }
-                        else if (sscanf(buf, "set com%d-T%d\n", &ord.n_ord, &ord.id_tb) == 2)
+                        else if (sscanf(buf, "set com%d-T%d\n", &ord.order_counter, &ord.table_ID) == 2)
                         {
-                            ord.sts = '1';
-                            update_sts("accepted.txt", '2', &ord);
-                            if (ord.id_ord)
+                            ord.status = 1;
+                            update_status_order("accepted.txt", '2', &ord);
+                            if (ord.order_ID)
                             {
-                                choice = 3;
-                                conv = htonl(choice);
+                                conv = htonl(UPDATE_STATUS_ORD_2);
                                 ret = send(kd.soc, (void *)&conv, sizeof(uint32_t), 0);
                                 if (ret < 0)
                                 {
                                     perror("Errore nell'invio del comando digitato\n");
                                     exit(1);
                                 }
-                                send_info_ord(&ord, kd.soc);
+                                send_info_order(&ord, kd.soc);
                             }
                             else
                             {
-                                printf("%s\n", "Non e' possibile portare in stato in servizio la comanda selezionata\n");
+                                printf("%s\n", "Non e' possibile aggiornare lo stato dell'ordine: in preparazione -> in servizio.\n");
                                 fflush(stdout);
                             }
                         }

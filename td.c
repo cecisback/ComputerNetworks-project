@@ -1,6 +1,19 @@
-#include "common.c"
+#include "client_side/communication_utilities/soc_client_utils.c"
+#include "client_side/headers/header_table_device.h"
+#include "client_side/headers/header_order.h"
+#include "client_side/order_shared_utils.c"
 
-void cleanup(struct select_elem *tb)
+void print_cmd()
+{
+    printf("%s", "1) help --> mostra i dettagli dei comandi\n");
+    printf("%s", "2) menu --> mostra il menu dei piatti\n");
+    printf("%s", "3) comanda --> invia una comanda\n");
+    printf("%s", "4) conto --> chiede il conto\n\n");
+    fflush(stdout);
+    return;
+}
+
+void cleanup_table_device(struct Socket_stream_IO *tb)
 {
     close(tb->soc);
     FD_ZERO(&tb->read_fds);
@@ -14,27 +27,31 @@ void cleanup(struct select_elem *tb)
     return;
 }
 
+
 /*
-    Prende il codice inserito da tastiera dall'utente e lo confronta
-    con il codice della prenotazione prevista per quel tavolo e per
-    quella data corrente.
+    Prende il codice di prenotazione inserito dall'utente e lo confronta
+    con il codice di prenotazione previsto per quel tavolo, per
+    la data e il turno di lavoro correnti.
 */
-void enter_cod(struct select_elem *tb, char *buf, int id_b)
+void enter_reservation_id(char *buf, int reservation_id)
 {
-    int cod;
-    char check;
+    int id;
+    char last_typed;
 
     while (1)
     {
         memset(buf, 0, MAX_SIZE);
-        cod = 0;
+        id = 0;
 
         if (fgets(buf, MAX_SIZE, stdin))
         {
-            if (sscanf(buf, "%d%c", &cod, &check) == 2)
+            if (sscanf(buf, "%d%c", &id, &last_typed) == 2)
             {
-                if ((cod && cod == id_b) && check == '\n')
-                    return;
+                if (id && last_typed == '\n'){
+                    if (id == reservation_id){
+                        return;
+                    }
+                }
             }
         }
     }
@@ -42,44 +59,43 @@ void enter_cod(struct select_elem *tb, char *buf, int id_b)
 }
 
 /*
-    Riceve dal server il codice di prenotazione previsto per quel tavolo
-    e per la data e fascia oraria corrente
+    Riceve dal server il codice di prenotazione previsto per quel tavolo, 
+    per la data e fascia oraria corrente.
 */
-void rcv_bk_oftheday(int sc, int *id_b)
+void receive_reservation_ID(int socket, int *reservation_ID)
 {
     int ret;
     uint32_t conv;
 
-    ret = recv(sc, (void *)&conv, sizeof(uint32_t), 0);
+    ret = recv(socket, (void *)&conv, sizeof(uint32_t), 0);
     if (ret < 0)
     {
         perror("Errore nella ricezione del codice di prenotazione\n");
         exit(1);
     }
-    *id_b = ntohl(conv);
-    printf("%d\n", *id_b); // cancella
+    *reservation_ID = ntohl(conv);
 
     return;
 }
 
 /*
-    Autenticazione del cliente per accedere ai servici del table device
+    Autenticazione del cliente per accedere ai servici del table device.
 */
-bool auth_client(char *buf, struct select_elem *tb)
+bool client_authentication(char *buf, struct Socket_stream_IO *tb)
 {
-    int id_b = 0;
+    int res_id = 0;
 
-    rcv_bk_oftheday(tb->soc, &id_b);
-    if (!id_b)
-    {
-        printf("%s\n", "Non sono previste prenotazioni per questa data\n");
+    receive_reservation_ID(tb->soc, &res_id);
+    if (!res_id)
+    {   
+        printf("%s\n", "Il codice di prenotazione ricevuto non è valido.");
         fflush(stdout);
         return false;
     }
 
-    printf("%s", "\nInserire il codice di prenotazione:\n\n");
+    printf("%s\n", "\nInserire il codice di prenotazione:\n");
     fflush(stdout);
-    enter_cod(tb, buf, id_b);
+    enter_reservation_id(buf, res_id);
     return true;
 }
 
@@ -112,15 +128,16 @@ void print_menu(char *buf)
     return;
 }
 
-void rcv_menu(int sc, char *buf)
+/*
+    Inoltra il comando per la ricezione del menù.
+*/
+void receive_menu(int sc, char *buf)
 {
-    int choice, ret;
+    int ret, length_file;
     uint32_t conv;
     FILE *f;
 
-    // invio richiesta menu
-    choice = 2;
-    conv = htonl(choice);
+    conv = htonl(MENU_CMD);
     ret = send(sc, (void *)&conv, sizeof(uint32_t), 0);
     if (ret < 0)
     {
@@ -128,9 +145,8 @@ void rcv_menu(int sc, char *buf)
         exit(1);
     }
 
-    // ricevo menu
-    ret = 0;
-    rcv_file(sc, buf, &ret);
+    length_file = 0;
+    receive_file(sc, buf, &length_file);
 
     f = fopen("menu.txt", "w");
     if (!f)
@@ -138,34 +154,23 @@ void rcv_menu(int sc, char *buf)
         perror("Errore nell'apertura del file menu.txt\n");
         exit(1);
     }
-    fprintf(f, "%s", buf);
+    fprintf(f, "%s\n", buf);
     fclose(f);
     return;
 }
 
-void print_cmd()
-{
-    printf("%s", "1) help --> mostra i dettagli dei comandi\n");
-    printf("%s", "2) menu --> mostra il menu dei piatti\n");
-    printf("%s", "3) comanda --> invia una comanda\n");
-    printf("%s", "4) conto --> chiede il conto\n\n");
-    fflush(stdout);
-    return;
-}
-
 /*
-    Fase pre autenticazione del cliente con la richiesta al server
-    del codice di prenotazione previsto per quel turno di lavoro
-    (se ci sono eventualmente prenotazioni per quel tavolo)
+    Fase di accensione del dispositivo: 
+    invio al server del comando per la ricezione del codice
+    di prenotazione previsto per il turno di lavoro corrente nel tavolo considerato.
 */
-void beginning(struct select_elem *tb, char *buf)
+void start_device(struct Socket_stream_IO *tb, char *buf)
 {
-    int choice, ret;
+    int ret;
     uint32_t conv;
 
     // invio al server un segnale per ricevere il codice
-    choice = -1;
-    conv = htonl(choice);
+    conv = htonl(TB_AUTHENTICATION_CMD);
     ret = send(tb->soc, (void *)&conv, sizeof(uint32_t), 0);
     if (ret < 0)
     {
@@ -173,31 +178,31 @@ void beginning(struct select_elem *tb, char *buf)
         exit(1);
     }
 
-    if (auth_client(buf, tb))
+    if (client_authentication(buf, tb))
     {
-        rcv_menu(tb->soc, buf);
+        receive_menu(tb->soc, buf);
         printf("%s", "\n****************************** BENVENUTO ******************************\n");
         printf("%s", "Digita un comando:\n\n");
         print_cmd();
-        printf("%s\n", buf); // stampa del menu'
+        printf("%s\n", buf);
         fflush(stdout);
     }
     return;
 }
 
 /*
-    Controllo che il formato con il quale sono stati specificati i piatti
-    nella comanda sia corretto.
-    Il menu precedentemente ricevuto serve per controllare che non siano
+    Controllo della correttezza del formato con il quale sono stati specificati i piatti
+    nella comanda.
+    Il menu' precedentemente ricevuto serve per controllare che non siano
     stati inseriti codici di piatti non presenti e dunque non ordinabili.
-    Il vettore pre_count serve a tenere traccia, per ogni piatto specificato e
-    presente nel menu',delle quantita' complessive richieste.
+    Il vettore tot_quantity_counter serve a tenere traccia, per ogni piatto specificato e
+    presente nel menu', delle quantita' complessive richieste.
 */
-bool check_format(int *pre_count, char **scorri)
+bool check_format(int *tot_quantity_counter, char **stream_reader)
 {
     int i;
-    char dish[MAX_SIZE];
-    struct dishes ds_ord, ds_menu;
+    struct Dish ordered_dish, menu_dish;
+    char typed_dish[MAX_SIZE];
 
     FILE *f = fopen("menu.txt", "r");
     if (!f)
@@ -206,43 +211,43 @@ bool check_format(int *pre_count, char **scorri)
         exit(1);
     }
 
-    memset(&ds_ord, 0, sizeof(struct dishes));
-    memset(&ds_menu, 0, sizeof(struct dishes));
-    memset(dish, 0, MAX_SIZE);
+    memset(&ordered_dish, 0, sizeof(struct Dish));
+    memset(&menu_dish, 0, sizeof(struct Dish));
+    memset(typed_dish, 0, MAX_SIZE);
 
-    // preleva l'id del piatto ordinato con relativa quantita'
-    while (sscanf(*scorri, " %[^\n ] ", dish) == 1)
+    // preleva l'ID del piatto ordinato con relativa quantita'
+    while (sscanf(*stream_reader, " %[^\n ] ", typed_dish) == 1)
     {
-        if (sscanf(dish, " %[^-]-%d ", ds_ord.id, &ds_ord.quanti) == 2)
+        if (sscanf(typed_dish, " %[^-]-%d ", ordered_dish.dish_ID, &ordered_dish.quantity) == 2)
         {
             rewind(f);
             i = 0;
-            // controllo l'id prelevato con ogni piatto presente nel menu'
+            // controllo l'ID prelevato con ogni piatto presente nel menu'
             while (!feof(f))
             {
-                if (fscanf(f, " %[^ ]%*[^\n] ", ds_menu.id))
+                if (fscanf(f, " %[^ ]%*[^\n] ", menu_dish.dish_ID))
                 {
-                    if (!strcmp(ds_menu.id, ds_ord.id))
+                    if (!strcmp(menu_dish.dish_ID, ordered_dish.dish_ID))
                     {
-                        pre_count[i] += ds_ord.quanti;
+                        tot_quantity_counter[i] += ordered_dish.quantity;
                         break;
                     }
                     i++;
                 }
             }
-            if (i == DIM_MENU)
+            if (i == MENU_SIZE)
                 break;
         }
         else
         {
-            i = DIM_MENU;
+            i = MENU_SIZE;
             break;
         }
-        *scorri += (strlen(dish) + 1);
+        *stream_reader += (strlen(typed_dish) + 1);
     }
-    // in questo caso non e' stato trovato nel menu un piatto con quell'id
+    // in questo caso non e' stato trovato nel menu un piatto con quell'ID
     // ed e' sufficiente uscire dal controllo senza procedere
-    if (i == DIM_MENU)
+    if (i == MENU_SIZE)
     {
         fclose(f);
         printf("Comanda errata\n");
@@ -254,110 +259,91 @@ bool check_format(int *pre_count, char **scorri)
     return true;
 }
 
-void prp_ord(int soc, struct order *ord, char *buf, int port)
+/*
+    Inoltra al server la richiesta di preparazione dell'ordine.
+    Questa consiste nell'invio del numero complessivo di ordini effettuati da quel tavolo
+    seguito dall'invio dell'ordine.
+*/
+void prepare_order(int soc, struct Order *ord, char *buf, int port)
 {
     int ret;
     uint32_t conv;
 
-    // invio il numero di ordine effettuato
-    ord->n_ord++;
-    conv = htonl(ord->n_ord);
+    // invio il numero complessivo di ordini effettuato
+    ord->order_counter++;
+    conv = htonl(ord->order_counter);
     ret = send(soc, (void *)&conv, sizeof(uint32_t), 0);
     if (ret < 0)
     {
-        perror("Errore nell'invio del numero di ordine\n");
+        perror("Errore nell'invio del numero complessivo di ordini effettuati\n");
         exit(1);
     }
 
-    if (port == 5001)
-    {
-        ord->id_tb = 0;
-    }
-    else if (port == 5002)
-    {
-        ord->id_tb = 1;
-    }
-    else if (port == 5003)
-    {
-        ord->id_tb = 2;
-    }
-
-    conv = htonl(ord->id_tb);
-    ret = send(soc, (void *)&conv, sizeof(uint32_t), 0);
-    if (ret < 0)
-    {
-        perror("Errore nell'invio dell'id del tavolo\n");
-        exit(1);
-    }
-
-    send_file(soc, buf, 0); // invio della comanda
+    send_file(soc, buf, 0);
     return;
 }
 
-void rcv_ACK_ord(int soc, char *dishes_list, struct order *ord)
+void receive_order_confirmation(int soc, char *dishes_list, struct Order *ord)
 {
-    int ret;
+    int ret, cmd;
     uint32_t conv;
-    char ACK[ACK_FOR_ORD];
 
-    memset(ACK, 0, ACK_FOR_ORD);
-
-    ret = recv(soc, (void *)&ACK, ACK_FOR_ORD, 0);
+    ret = recv(soc, (void *)&conv, sizeof(uint32_t), 0);
     if (ret < 0)
     {
         perror("Errore nella ricezione dell'ACK per la corretta ricezione dell'ordine\n");
         exit(1);
     }
+    cmd = ntohl(conv);
 
-    if (!strcmp(ACK, "CR\n"))
+    if (cmd == ORDER_ACK)
     {
         printf("COMANDA RICEVUTA\n");
         fflush(stdout);
         ret = recv(soc, (void *)&conv, sizeof(uint32_t), 0);
         if (ret < 0)
         {
-            perror("Errore nella ricezione dell'id dell'ordine\n");
+            perror("Errore nella ricezione dell'ID dell'ordine\n");
             exit(1);
         }
-        ord->id_ord = ntohl(conv);
-        save_ord(dishes_list, ord);
-        printf("\n");
+        ord->order_ID = ntohl(conv);
+        printf("Ordine N: %d\n %s\n", ord->order_ID, dishes_list);
         fflush(stdout);
     }
     else
     {
-        printf("Server non ha ricevuto correttamente la comanda\n");
+        printf("L'invio dell'ordine non è andato a buon fine.\n");
         fflush(stdout);
     }
     return;
 }
 
-bool take_order(char *buf, struct order *ord)
+bool take_order(char *buf, struct Order *ord)
 {
     int i;
-    char *scorri = &buf[8];
-    int pre_count[DIM_MENU];
+    char *stream_reader = &buf[8];
+    int tot_quantity_counter[MENU_SIZE];
 
-    memset(pre_count, 0, sizeof(pre_count));
+    memset(tot_quantity_counter, 0, sizeof(tot_quantity_counter));
 
-    if (check_format(pre_count, &scorri))
+    if (check_format(tot_quantity_counter, &stream_reader))
     {
-        for (i = 0; i < DIM_MENU; i++)
+        for (i = 0; i < MENU_SIZE; i++)
         {
-            if (pre_count[i])
-                ord->qty[i] += pre_count[i];
+            if (tot_quantity_counter[i])
+                ord->quantity[i] += tot_quantity_counter[i];
         }
         return true;
     }
     return false;
 }
 
-bool make_recap(int soc, char *buf, int *count)
+bool generate_recap_orders(char *buf, int *quantity)
 {
     int i;
     FILE *f, *fs;
-    char *scorri = &buf[0];
-    bool ret = false;
+    char *stream_reader = &buf[0];
+    bool outcome = false;
 
     memset(buf, 0, MAX_SIZE);
 
@@ -373,32 +359,32 @@ bool make_recap(int soc, char *buf, int *count)
     if (!f)
     {
         perror("Errore nell'apertura del file recap.txt\n");
-        return false;
+        return outcome;
     }
 
     rewind(fs);
-    for (i = 0; i < DIM_MENU; i++)
+    for (i = 0; i < MENU_SIZE; i++)
     {
-        if (fscanf(f, " %2c%*[^\n] ", scorri))
+        if (fscanf(f, " %2c%*[^\n] ", stream_reader))
         {
-            if (count[i])
+            if (quantity[i])
             {
-                fprintf(fs, "%-3s %-4d\n", scorri, count[i]);
-                ret = true;
+                fprintf(fs, "%-3s %-4d\n", stream_reader, quantity[i]);
+                outcome = true;
             }
             else
-                strcpy(scorri, "");
+                strcpy(stream_reader, "");
         }
     }
     fclose(fs);
     fclose(f);
-    return ret;
+    return outcome;
 }
 
 void send_recap(int soc, char *buf)
 {
     FILE *f;
-    char *scorri = &buf[0];
+    char *stream_reader = &buf[0];
     memset(buf, 0, MAX_SIZE);
 
     f = fopen("recap.txt", "r");
@@ -407,10 +393,10 @@ void send_recap(int soc, char *buf)
         rewind(f);
         while (!feof(f))
         {
-            if (fscanf(f, " %[^\n] ", scorri))
+            if (fscanf(f, " %[^\n] ", stream_reader))
             {
-                strcat(scorri, "\n");
-                scorri += strlen(scorri);
+                strcat(stream_reader, "\n");
+                stream_reader += strlen(stream_reader);
             }
         }
         fclose(f);
@@ -419,16 +405,17 @@ void send_recap(int soc, char *buf)
     return;
 }
 
-void rcv_tot(int soc, char *buf)
+void receive_full_order_amount(int soc, char *buf)
 {
-    int ret;
-    uint32_t conv;
-    char *scorri = &buf[0];
     char dish[MAX_SIZE];
+    char *stream_reader = &buf[0];
+
+    uint32_t conv;
+    int ret;
 
     memset(dish, 0, MAX_SIZE);
 
-    while (sscanf(scorri, " %[^\n] ", dish) == 1)
+    while (sscanf(stream_reader, " %[^\n] ", dish) == 1)
     {
         printf("%s", dish);
         fflush(stdout);
@@ -441,7 +428,7 @@ void rcv_tot(int soc, char *buf)
         }
         printf("%-d\n", ntohl(conv));
         fflush(stdout);
-        scorri += (strlen(dish) + 1);
+        stream_reader += (strlen(dish) + 1);
     }
 
     printf("%s ", "Totale: ");
@@ -459,33 +446,43 @@ void rcv_tot(int soc, char *buf)
     return;
 }
 
+/*
+    Controlla che la porta associata dall'utente al momento
+    della chiamata al programma sia effettivamente corretta
+*/
+bool check_port_table(int port)
+{
+    if (port > TABLE_1_PORT && port < TABLE_4_PORT)
+        return true;
+   
+    return false;
+}
+
 int main(int argc, char *argv[])
 {
     struct sockaddr_in server_address, my_address;
-    struct select_elem tb;
-    struct order ord;
-    int ret, choice, i, port;
+    struct Order ord;
+    int ret, command, port;
     uint32_t conv;
+    
     char buf[MAX_SIZE];
+    struct Socket_stream_IO tb;
 
-    memset(&tb, 0, sizeof(struct select_elem));
-    memset(&ord, 0, sizeof(struct order));
+    memset(&tb, 0, sizeof(struct Socket_stream_IO));
+    memset(&ord, 0, sizeof(struct Order));
 
-    if (argc == 2)
+    port = atoi(argv[1]);
+    if (!check_port_table(port))
     {
-        port = atoi(argv[1]);
-        if (!check_port(port, 1))
-        {
-            perror("Porta errata\n");
-            exit(1);
-        }
+        perror("Porta errata\n");
+        exit(1);
     }
-    port = 5001;
-    tb.soc = create_sc_client(&server_address, &my_address, port);
-    beginning(&tb, buf);
-    init_pre_select(&tb);
 
-    for (;;)
+    tb.soc = create_soc_client(&server_address, &my_address, port);
+    start_device(&tb, buf);
+    init_stream_IO(&tb);
+
+    while (1)
     {
         tb.read_fds = tb.master;
 
@@ -496,94 +493,95 @@ int main(int argc, char *argv[])
             exit(1);
         }
 
-        for (i = 0; i <= tb.max_fd; i++)
-        {
-            memset(buf, 0, MAX_SIZE);
-            choice = 0;
+        memset(buf, 0, MAX_SIZE);
+        command = 0;
 
-            if (FD_ISSET(i, &tb.read_fds))
+        if (FD_ISSET(tb.soc, &tb.read_fds))
+        {
+            ret = recv(tb.soc, (void *)&conv, sizeof(uint32_t), 0);
+            if (ret < 0)
             {
-                if (i == STDIN_FILENO)
+                perror("Errore nel messaggio ricevuto\n");
+                exit(1);
+            }
+            command = ntohl(conv);
+
+            if (command == STOP_SERVER_CMD)
+            {
+                cleanup_table_device(&tb);
+                return 0;
+            }
+            else if (command == TB_AUTHENTICATION_CMD)
+            {
+                if (client_authentication(buf, &tb))
                 {
-                    if (fgets(buf, MAX_SIZE, stdin))
-                    {
-                        if (!strcmp(buf, "help\n"))
-                            print_cmd();
-                        else if (!strcmp(buf, "menu\n"))
-                            print_menu(buf);
-                        else if (!strcmp(buf, "conto\n"))
-                        {
-                            if (check_sts_ord(buf))
-                            {
-                                if (make_recap(tb.soc, buf, ord.qty))
-                                {
-                                    choice = 4;
-                                    conv = htonl(choice);
-                                    ret = send(tb.soc, (void *)&conv, sizeof(uint32_t), 0);
-                                    if (ret < 0)
-                                    {
-                                        perror("Errore nell'invio del comando\n");
-                                        exit(1);
-                                    }
-                                    send_recap(tb.soc, buf);
-                                    rcv_tot(tb.soc, buf);
-                                    cleanup(&tb);
-                                    return 0;
-                                }
-                                else
-                                {
-                                    printf("%s\n", "Non sono state effettuate ordinazioni");
-                                    fflush(stdout);
-                                }
-                            }
-                            else
-                            {
-                                printf("Non tutte le comande sono state servite\n");
-                                fflush(stdout);
-                            }
-                        }
-                        else if (!strncmp(buf, "comanda ", 8))
-                        {
-                            if (take_order(buf, &ord))
-                            {
-                                choice = 3;
-                                conv = htonl(choice);
-                                ret = send(tb.soc, (void *)&conv, sizeof(uint32_t), 0);
-                                if (ret < 0)
-                                {
-                                    perror("Errore nell'invio del comando\n");
-                                    exit(1);
-                                }
-                                prp_ord(tb.soc, &ord, &buf[8], port);
-                                rcv_ACK_ord(tb.soc, &buf[8], &ord);
-                            }
-                        }
-                    }
+                    receive_menu(tb.soc, buf);
+                    printf("%s", "\n****************************** BENVENUTO ******************************\n");
+                    printf("%s", "Digita un comando:\n\n");
+                    print_cmd();
+                    printf("%s\n", buf);
+                    fflush(stdout);
+                }
+            }
+            else if (command == UPDATE_STATUS_ORD_1 || command == UPDATE_STATUS_ORD_2)
+            {
+                receive_info_order(&ord, tb.soc);
+                if (command == UPDATE_STATUS_ORD_1)
+                {
+                    printf("Ordine n.%d in preparazione\n", ord.order_ID);
                 }
                 else
                 {
-                    ret = recv(tb.soc, (void *)&conv, sizeof(uint32_t), 0);
-                    if (ret < 0)
+                    printf("Ordine n.%d in servizio\n", ord.order_ID);
+                }
+                fflush(stdout);
+            }
+        }
+        else
+        {
+            if (fgets(buf, MAX_SIZE, stdin))
+            {
+                if (!strcmp(buf, "help\n"))
+                    print_cmd();
+                else if (!strcmp(buf, "menu\n"))
+                    print_menu(buf);
+                else if (!strcmp(buf, "conto\n"))
+                {
+                    if (generate_recap_orders(buf, ord.quantity))
                     {
-                        perror("Errore nel messaggio ricevuto\n");
-                        exit(1);
-                    }
+                        command = END_TB_CONNECTION;
+                        conv = htonl(command);
+                        ret = send(tb.soc, (void *)&conv, sizeof(uint32_t), 0);
+                        if (ret < 0)
+                        {
+                            perror("Errore nell'invio del comando\n");
+                            exit(1);
+                        }
 
-                    choice = ntohl(conv);
-                    if (choice == -2)
-                    {
-                        cleanup(&tb);
-                        return 0;
+                        send_recap(tb.soc, buf);
+                        receive_full_order_amount(tb.soc, buf);
+                        cleanup_table_device(&tb);
+                        break;
                     }
-                    else if (choice == 1)
+                    else
                     {
-                        rcv_info_ord(&ord, tb.soc);
-                        update_sts("ord_oftheday.txt", '1', &ord);
+                        printf("Non tutte le comande sono state servite\n");
+                        fflush(stdout);
                     }
-                    else if (choice == 2)
+                }
+                else if (!strncmp(buf, "comanda ", 8))
+                {
+                    if (take_order(buf, &ord))
                     {
-                        rcv_info_ord(&ord, tb.soc);
-                        update_sts("ord_oftheday.txt", '2', &ord);
+                        conv = htonl(COMANDA_CMD);
+                        ret = send(tb.soc, (void *)&conv, sizeof(uint32_t), 0);
+                        if (ret < 0)
+                        {
+                            perror("Errore nell'invio del comando\n");
+                            exit(1);
+                        }
+                        prepare_order(tb.soc, &ord, &buf[8], port);
+                        receive_order_confirmation(tb.soc, &buf[8], &ord);
                     }
                 }
             }
