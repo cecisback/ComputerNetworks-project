@@ -16,6 +16,7 @@ There are some valid aspects that implicitly *authenticate the client* server si
 - each booking is univoquely identified by a *numeric code* that the server retrieves at the beginning of each workshift and that must corresponds to the one forwarded by the client during the *authentication phase*;
 
 ## Project Structure
+```
 .
 |
 |- client_side
@@ -41,3 +42,5 @@ There are some valid aspects that implicitly *authenticate the client* server si
 |- cli.c
 |- td.c
 |- README.md
+
+```
